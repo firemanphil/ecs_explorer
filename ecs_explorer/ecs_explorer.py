@@ -349,5 +349,6 @@ BODY_CONTROLLER = BodyController(CLUSTERS)
 
 LAYOUT = urwid.Frame(body=BODY_CONTROLLER.body, footer=FOOTER)
 
-MAIN_LOOP = urwid.MainLoop(LAYOUT, PALETTE, unhandled_input=exit_on_cr)
-MAIN_LOOP.run()
+def __main__():
+    MAIN_LOOP = urwid.MainLoop(LAYOUT, PALETTE, unhandled_input=exit_on_cr)
+    MAIN_LOOP.run()
