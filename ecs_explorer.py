@@ -1,103 +1,121 @@
 #!/usr/bin/env python
 # encoding: utf-8
 import json
-import urwid
-import threading
-import boto3
 import datetime
 from datetime import datetime
 import sys
-from collections import defaultdict
-from dateutil.tz import tzlocal
 import argparse
-import pprint
 from ecs_client import EcsClient
 from urwid.command_map import ACTIVATE
+import urwid
+
+class BodyController(object):
+
+    def __init__(self, initial_buttons):
+        self.list_stack = [('Clusters', initial_buttons)]
+        formatted_data = [urwid.AttrMap(b, None, 'reveal focus')
+                          for b in initial_buttons]
+        self.list_walker = ChooseFromListWalker(formatted_data, self)
+        list_box = ChooseFromListBox(self.list_walker)
+        column_array = convert_details_to_columns(
+            initial_buttons[0].retrieve_important_details())
+
+        self.cols = urwid.Columns(
+            [('weight', 1, column_array[0]), ('weight', 4,column_array[1])], )
+        self.detail_view = False
+        self.title = urwid.AttrMap(urwid.Text(self.list_stack[-1][0]), 'title')
+        self.cols_title = urwid.AttrMap(urwid.Text(u'Attributes'), 'title')
+        self.body = urwid.Pile([(2, urwid.Filler(self.title, valign='top')), list_box, (
+            2, urwid.Filler(self.cols_title, valign='top')), self.cols])
+        self.before_detail = None
+
+    def item_focus_change(self, item):
+        column_array = convert_details_to_columns(
+            item.retrieve_important_details())
+
+        self.cols.contents = [
+            (column_array[0], ('weight', 1, False)), (column_array[1], ('weight', 4, False))]
+
+    def toggle_detail(self, item):
+        if not self.detail_view:
+            self.before_detail = self.body
+            detail_text = json.dumps(
+                item.detail, indent=4, sort_keys=True, cls=DateTimeEncoder)
+            lines = detail_text.split('\n')
+            text_lines = [urwid.Text(l) for l in lines]
+            list_box = DetailListBox(
+                urwid.SimpleFocusListWalker(text_lines), self)
+            self.body = list_box
+            LAYOUT.contents['body'] = (self.body, None)
+            self.detail_view = True
+        else:
+            self.body = self.before_detail
+            LAYOUT.contents['body'] = (self.body, None)
+            del self.before_detail
+            self.detail_view = False
+
+    def show_parent_list(self, item):
+        if len(self.list_stack) > 1:
+            del item.lines[:]
+            self.list_stack.pop()
+            top_title, previous = self.list_stack[-1]
+            data = [urwid.AttrMap(c, None, 'reveal focus') for c in previous]
+            self.title.base_widget.set_text(top_title)
+            item.lines.extend(data)
+            item.set_focus(0)
+            item._modified()
+
+    def show_children(self, list_walker):
+        item = list_walker.lines[list_walker.focus].base_widget
+        top_title, children = item.retrieve_children()
+
+        if children:
+            self.title.base_widget.set_text(top_title)
+            list_walker.set_focus(0)
+            del list_walker.lines[:]
+            self.list_stack.append((top_title, children))
+            data = [urwid.AttrMap(ch, None, 'reveal focus') for ch in children]
+            list_walker.lines.extend(data)
+            list_walker.set_focus(0)
+            list_walker._modified()
+
 
 class DateTimeEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, datetime):
             return o.isoformat()
-	return json.JSONEncoder.default(self, o)
+        return json.JSONEncoder.default(self, o)
+
 
 class DetailListBox(urwid.ListBox):
 
-    def __init__(self, body, parent):
-        self.parent = parent
+    def __init__(self, body, controller):
+        self.controller = controller
         super(DetailListBox, self).__init__(body)
 
     def keypress(self, size, key):
         if key == 'b':
-            self.parent.keypress(size, 'd')
+            self.controller.toggle_detail(self)
         else:
-            urwid.ListBox.keypress(self, size, key)
+            super(DetailListBox, self).keypress(size, key)
+
 
 class EcsButton(urwid.Button):
-    
+
     def __init__(self, identifier, name, detail):
         self.identifier = identifier
         self.detail = detail
-        self.name=name
+        self.name = name
         self.showing_detail = False
         super(EcsButton, self).__init__(name)
 
-    def keypress(self, size, key):
-        sys.stderr.write("key was " + key + "\n")
-        if key == 'd':
-            self.toggle_detail()
-        elif key == 'b':
-            if len(stack) > 1:
-                del subListWalker.lines[:]
-                hi = stack.pop()
-                previous = stack[-1]
-                currentListByName.clear()
-                currentListByName.update(dict((c.name, c) for c in previous))
-                data = [urwid.AttrMap(c, None, 'reveal focus') for c in previous ]
-                subListWalker.lines.extend(data)
-                subListWalker.set_focus(0)
-                subListWalker._modified()
-        elif key == 'u':
-            #show detail
-            pass
-        elif self._command_map[key] == ACTIVATE:
-            self.show_children()
-        return key
-
-    def toggle_detail(self):
-        if not self.showing_detail:
-            self.before_detail = layout.contents['body']
-            detail_text = json.dumps(self.detail, indent=4, sort_keys=True, cls=DateTimeEncoder)
-            lines = detail_text.split('\n')
-            text_lines = [urwid.Text(l) for l in lines]
-            list_box = DetailListBox(urwid.SimpleFocusListWalker(text_lines), self)
-            layout.contents['body'] = (list_box, None) 
-            self.showing_detail = True
-        else: 
-            layout.contents['body'] = self.before_detail
-            del self.before_detail
-            self.showing_detail = False
-    
-    def show_children(self):
-
-        children = self.retrieve_children()
-        if len(children) > 0:
-            subListWalker.set_focus(0)
-            del subListWalker.lines[:]
-            dict_children = dict((c.name, c) for c in children)
-            currentListByName.clear()
-            currentListByName.update(dict_children)
-            sys.stderr.write("\n"+ str(currentListByName))
-            stack.append(children)
-            data = [urwid.AttrMap(c, None, 'reveal focus') for c in children ]
-            subListWalker.lines.extend(data)
-            subListWalker.set_focus(0)
-            subListWalker._modified()
-
-    def retrieve_children():
+    def retrieve_children(self):
         pass
+
 
 class Cluster(EcsButton):
     clustersByName = dict()
+
     def __init__(self, identifier, name, detail):
         super(Cluster, self).__init__(identifier, name, detail)
 
@@ -109,48 +127,89 @@ class Cluster(EcsButton):
                 ("Containers", self.detail['registeredContainerInstancesCount'])]
 
     def retrieve_children(self):
-        return [ServicesLabel(self.identifier), ContainersLabel(self.identifier)]
+        return ("Choose sub-resource", [ServicesLabel(self.identifier), ContainersLabel(self.identifier)])
+
 
 class ServicesLabel(EcsButton):
     def __init__(self, cluster_identifier):
         super(ServicesLabel, self).__init__(cluster_identifier, "Services", "")
-        
+
     def retrieve_children(self):
-        return [Service(s['serviceArn'], s['serviceName'], self.identifier, s) for s in ecs_client.retrieveServicesForCluster(self.identifier).values()]
+        return ("Services", [Service(s['serviceArn'], s['serviceName'], self.identifier, s) for s in ECS_CLIENT.retrieve_services(self.identifier).values()])
 
     def retrieve_important_details(self):
         return []
+
 
 class ContainersLabel(EcsButton):
     def __init__(self, cluster_identifier):
-        super(ContainersLabel, self).__init__(cluster_identifier, "Containers", "")
+        super(ContainersLabel, self).__init__(
+            cluster_identifier, "Containers", "")
 
     def retrieve_children(self):
-        return [Container(c['containerInstanceArn'], c['ec2InstanceId'], self.identifier, c) for c in ecs_client.retrieveContainersForCluster(self.identifier)]
+        containers = ECS_CLIENT.retrieve_containers(self.identifier)
+        containers_by_id = dict((value[0]['containerInstanceArn'], value) for (key, value) in containers.iteritems())
+        return ("Containers", [Container(key, key.split("/")[1], self.identifier, value) for (key, value) in containers_by_id.iteritems()])
 
     def retrieve_important_details(self):
         return []
+
 
 class Container(EcsButton):
 
     def __init__(self, identifier, name, cluster_identifier, detail):
         super(Container, self).__init__(identifier, name, detail)
-        self.cluster_identifier = cluster_identifier;
-    
+        self.cluster_identifier = cluster_identifier
+
     def retrieve_children(self):
-        return []
+        return (None, None)
 
     def retrieve_important_details(self):
-        return []
+        cont_detail = self.detail[0]
+        attributes = cont_detail['attributes']
+        registered_resources = cont_detail['registeredResources']
+        available_resources = cont_detail['remainingResources']
+        ami_id = next(
+            obj for obj in attributes if obj['name'] == 'ecs.ami-id')['value']
+        instance_type = next(
+            obj for obj in attributes if obj['name'] == 'ecs.instance-type')['value']
+        availability_zone = next(
+            obj for obj in attributes if obj['name'] == 'ecs.availability-zone')['value']
+        available_memory = next(
+            obj for obj in available_resources if obj['name'] == 'MEMORY')['integerValue']
+        total_memory = next(
+            obj for obj in registered_resources if obj['name'] == 'MEMORY')['integerValue']
+        available_cpu = next(obj for obj in available_resources if obj['name'] == 'CPU')[
+            'integerValue']
+        total_cpu = next(obj for obj in registered_resources if obj['name'] == 'CPU')[
+            'integerValue']
+        taken_ports = ", ".join(sorted(next(
+            obj for obj in available_resources if obj['name'] == 'PORTS')['stringSetValue']))
+        return [('Status', cont_detail['status']),
+                ('EC2 Instance Id', cont_detail['ec2InstanceId']),
+                ('Private IP', self.detail[1]['PrivateIpAddress']),
+                ('Private DNS Name', self.detail[1]['PrivateDnsName']),
+                ('Public DNS Name', self.detail[1]['PublicDnsName']),
+                ('Running Tasks', cont_detail['runningTasksCount']),
+                ('Pending Tasks', cont_detail['pendingTasksCount']),
+                ('AMI Id', ami_id),
+                ('Instance Type', instance_type),
+                ('Availability Zone', availability_zone),
+                ('Memory', 'Available: ' + str(available_memory) +
+                 " Total: " + str(total_memory)),
+                ('CPU', 'Available: ' + str(available_cpu) +
+                 " Total: " + str(total_cpu)),
+                ('Taken ports', taken_ports)]
+
 
 class Service(EcsButton):
 
     def __init__(self, identifier, name, cluster_identifier, detail):
         super(Service, self).__init__(identifier, name, detail)
-        self.cluster_identifier = cluster_identifier;
-    
+        self.cluster_identifier = cluster_identifier
+
     def retrieve_children(self):
-        return [Task(self.identifier, self.cluster_identifier, t['taskArn'], t) for t in ecs_client.retrieveTasksForService(self.cluster_identifier, self.identifier).values()]
+        return ("Tasks", [Task(self.identifier, self.cluster_identifier, t['taskArn'].split("/")[1], t) for t in ECS_CLIENT.retrieve_tasks(self.cluster_identifier, self.identifier).values()])
 
     def retrieve_important_details(self):
         deployment_config = self.detail['deploymentConfiguration']
@@ -163,7 +222,9 @@ class Service(EcsButton):
                 ('Running', self.detail['runningCount']),
                 ('Pending', self.detail['pendingCount']),
                 ('Desired', self.detail['desiredCount']),
-                ('Redeployment bracket', "Min: " + str(min_bracket) + "%, Max: " + str(max_bracket))]
+                ('Redeployment bracket', "Min: " + str(min_bracket) + "%, Max: " + str(max_bracket) + "%")]
+
+
 class Task(EcsButton):
 
     def __init__(self, service_identifier, cluster_identifier, identifier, detail):
@@ -172,122 +233,79 @@ class Task(EcsButton):
         self.cluster_identifier = cluster_identifier
 
     def retrieve_children(self):
-        return []
+        return (None, None)
 
-    def rewriteContainer(self, container):
-        networkBindings = container['networkBindings']
-        bindings = [network['bindIP'] + " (" + str(network['hostPort']) + "[host] -> " + str(network['containerPort'])+ "[network])" for network in networkBindings]
+    def rewrite_container(self, container):
+        network_bindings = container['networkBindings']
+        bindings = [network['bindIP'] + " (" + str(network['hostPort']) + "[host] -> " + str(
+            network['containerPort']) + "[network])" for network in network_bindings]
         if bindings is []:
             bindings = "no network binding"
         else:
-            sys.stderr.write( "\n[" + str(bindings) + "]\n")
-            bindings = ', '.join(bindings) 
-        return container['name'] + " -> " + bindings 
-        
+            bindings = ', '.join(bindings)
+        return container['name'] + " -> " + bindings
+
     def retrieve_important_details(self):
-        containers = [self.rewriteContainer(c) for c in self.detail['containers']]
+        containers = [self.rewrite_container(cont)
+                      for cont in self.detail['containers']]
         return [('Status', self.detail['lastStatus']),
                 ('Desired Status', self.detail['desiredStatus']),
-                ('Container Instance ID', self.detail['containerInstanceArn'].split("/",1)[1]),
+                ('Task Definition', self.detail['taskDefinitionArn']),
+                ('Container Instance ID',
+                 self.detail['containerInstanceArn'].split("/", 1)[1]),
                 ('Containers', '\n'.join(containers))]
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--list', action='store_true')
-parser.add_argument("acct_to_assume")
-parser.add_argument("role_to_assume")
 
-def createButtonForListItem(item):
-    button  = urwid.Button(c.name)
-    return button
-
-def convertDetailsToColumns(details):
+def convert_details_to_columns(details):
     labels = []
     data = []
     for detail in details:
-        sys.stderr.write("conv" + str(detail[0]))
         labels.append(detail[0])
         data.append(str(detail[1]))
     text1 = '\n'.join(labels)
-    sys.stderr.flush()
     text2 = '\n'.join(data)
     filler1 = urwid.Filler(urwid.Text(text1, 'left'), valign='top')
     filler2 = urwid.Filler(urwid.Text(text2, 'left'), valign='top')
-    return [filler1,filler2]
+    return [filler1, filler2]
 
-def exit_on_cr(input):
-    if input in ('q', 'Q'):
+
+def exit_on_cr(key):
+    if key in ('q', 'Q'):
         raise urwid.ExitMainLoop()
 
-#    elif input == 'up':
-#        focus_widget, idx = subListBox.get_focus()
-#        sys.stderr.write("pressed <up> " + str(subListBox.get_focus()) +"\n") 
-#        if idx > 0:
-#            idx = idx-1
-#
-#            subListWalker.set_focus(idx)
-#            focus_widget, _ = subListBox.get_focus()
-#            name = focus_widget.base_widget.text
-#            item = currentListByName[name]
-#    elif input == 'down':
-#        focus_widget, idx = subListBox.get_focus()
-#        sys.stderr.write("pressed <down> " + str(subListBox.get_focus()) +"\n") 
-#        if idx < len(subListWalker.lines) -1:
-#            idx = idx+1
-#            subListWalker.set_focus(idx)
-#            focus_widget, _ = subListBox.get_focus()
-#            name = focus_widget.base_widget.text
-#            item = currentListByName[name]
-#    elif input == 'enter':
-#        focus_widget, _ = subListBox.get_focus()
-#        name = focus_widget.base_widget.text
-#        item = currentListByName[name]
-#        subListWalker.set_focus(0)
-#        del subListWalker.lines[:]
-#        children = item.retrieve_children()
-#        dict_children = dict((c.name, c) for c in children)
-#        currentListByName.clear()
-#        currentListByName.update(dict_children)
-#        stack.append(children)
-#        data = [urwid.AttrMap(urwid.Text(c.name), None, 'reveal focus') for c in children ]
-#        subListWalker.lines.extend(data)
-#        subListWalker._modified()
 
-class LineWalker(urwid.ListWalker):
-    """ListWalker-compatible class for lazily reading file contents."""
+class ChooseFromListBox(urwid.ListBox):
 
-    def __init__(self, data):
+    def keypress(self, size, key):
+        return super(ChooseFromListBox, self).keypress(size, self.body.keypress(size, key))
+
+
+class ChooseFromListWalker(urwid.ListWalker):
+
+    def __init__(self, data, controller):
         self.lines = data
         self.focus = 0
+        self.controller = controller
 
     def get_focus(self):
-        sys.stderr.write("get_focus " + str(self.focus) +"\n") 
         return self._get_at_pos(self.focus)
 
     def set_focus(self, focus):
-        sys.stderr.write("set_focus " + str(focus) +"\n") 
-        self.focus = focus        
-        sys.stderr.write("widg " + str(self.lines))
-        text = self.lines[focus].base_widget.label
-        item = currentListByName[text]
-        columnArray = convertDetailsToColumns(item.retrieve_important_details()) 
+        self.focus = focus
+        BODY_CONTROLLER.item_focus_change(self.lines[focus].base_widget)
 
-        cols.contents = [(columnArray[0], ('weight', 1, False)), (columnArray[1], ('weight', 4, False))]
-        
         self._modified()
 
     def get_next(self, start_from):
-        sys.stderr.write("get_next " + str(start_from) +"\n") 
         return self._get_at_pos(start_from + 1)
 
     def get_prev(self, start_from):
-        sys.stderr.write("get_prev " + str(start_from) +"\n") 
-        
+
         return self._get_at_pos(start_from - 1)
 
     def _get_at_pos(self, pos):
         """Return a widget for the line number passed."""
-        sys.stderr.write("_get_at_pos " + str(pos) +"\n") 
         if pos < 0:
             # line 0 is the start of the file, no more above
             return None, None
@@ -298,39 +316,38 @@ class LineWalker(urwid.ListWalker):
 
         return None, None
 
+    def keypress(self, size, key):
 
-currentListByName = dict()
+        if key == 'd':
+            BODY_CONTROLLER.toggle_detail(self.lines[self.focus].base_widget)
+            # self.lines[self.focus].base_widget.toggle_detail()
+        elif key == 'b':
+            BODY_CONTROLLER.show_parent_list(self)
+        elif key == 'u':
+            # show detail
+            pass
+        elif self.get_focus()[0]._command_map[key] == ACTIVATE:
+            BODY_CONTROLLER.show_children(self)
+        return key
 
-args = parser.parse_args()
-ecs_client = EcsClient(args.acct_to_assume, args.role_to_assume)
+PARSER = argparse.ArgumentParser()
+PARSER.add_argument("--role", default=None, help='An STS role to assume')
 
-palette = [('title', 'black', 'white'),
+ARGS = PARSER.parse_args()
+ECS_CLIENT = EcsClient(ARGS.role)
+
+PALETTE = [('title', 'yellow', 'dark blue'),
            ('reveal focus', 'black', 'white')]
 
-header = urwid.AttrMap(urwid.Text(u'ECS Explorer'), 'title')
-footer = urwid.Text(u'Press \'u\' to update and \'q\' to quit')
+FOOTER = urwid.AttrMap(urwid.Text(
+    u'Press \'u\' to update, \'<enter>\' to look at sub-resources, \'b\' to go back to the previous page and \'q\' to quit'), 'title')
 
-clusters = [Cluster(c, k['clusterName'], k) for (c,k) in ecs_client.retrieveClusters().items()]
+CLUSTERS = [Cluster(c, k['clusterName'], k)
+            for (c, k) in ECS_CLIENT.retrieve_clusters().items()]
+CLUSTERS.sort(lambda x, y: cmp(x.name, y.name))
+BODY_CONTROLLER = BodyController(CLUSTERS)
 
-currentListByName.update( dict((c.label, c) for c in clusters))
-stack = [clusters]
+LAYOUT = urwid.Frame(body=BODY_CONTROLLER.body, footer=FOOTER)
 
-data = [urwid.AttrMap(c, None, 'reveal focus') for c in clusters ]
-subListWalker = LineWalker(data)
-subListBox = urwid.ListBox(subListWalker)
-div = urwid.Filler(urwid.Divider(), valign='top')
-text1 = urwid.Filler(urwid.Text("text1", 'left'), valign='top')
-text2 = urwid.Filler(urwid.Text("text1", 'left'), valign='top')
-
-cols = urwid.Columns([text1, text2], )
-
-totalPile = urwid.Pile([subListBox, cols])
-#totalPile = urwid.Pile([('weight', 1,subListBox),('weight', 1, cols)])
-#totalPile = urwid.Pile([('weight', 1,subListBox)])
-#totalPile = urwid.Pile([urwid.BoxAdapter(subListBox, 30), div,cols])
-#top = urwid.Filler(totalPile, valign='top')
-
-layout = urwid.Frame(header=header, body = totalPile, footer = footer)
-
-main_loop = urwid.MainLoop(layout, palette, unhandled_input=exit_on_cr)
-main_loop.run()
+MAIN_LOOP = urwid.MainLoop(LAYOUT, PALETTE, unhandled_input=exit_on_cr)
+MAIN_LOOP.run()

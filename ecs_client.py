@@ -1,121 +1,135 @@
 from collections import defaultdict
+import itertools
 import threading
 import Queue
 import boto3
 
-class EcsClient:
+class EcsClient(object):
 
-    def __init__(self, acct_to_assume, role_to_assume):
-        self.acct_to_assume = acct_to_assume
+    def __init__(self, role_to_assume):
         self.role_to_assume = role_to_assume
         boto3.setup_default_session(profile_name='default')
+        if role_to_assume:
+            self.client = boto3.client('sts')
+            response = self.client.assume_role(
+                RoleArn=role_to_assume, RoleSessionName="ecs_explorer")
 
-        self.client = boto3.client('sts')
-    
-    def retrieveClusterDescriptionsByArn(self, clusters):
+            creds = response['Credentials']
+            self.ecs = boto3.client('ecs',
+                                    aws_access_key_id=creds['AccessKeyId'],
+                                    aws_secret_access_key=creds['SecretAccessKey'],
+                                    aws_session_token=creds['SessionToken'])
+
+            self.ec2 = boto3.client('ec2',
+                                    aws_access_key_id=creds['AccessKeyId'],
+                                    aws_secret_access_key=creds['SecretAccessKey'],
+                                    aws_session_token=creds['SessionToken'])
+        else: 
+            self.ecs = boto3.client('ecs')
+            self.ec2 = boto3.client('ec2')
+
+    def retrieve_cluster_descs(self, clusters):
         descriptions = self.ecs.describe_clusters(clusters=clusters)
         return dict((c['clusterArn'], c) for c in descriptions['clusters'])
 
-    def retrieveContainersForCluster(self, cluster):
-        firstTime = True
+    def retrieve_containers(self, cluster):
+        first_time = True
         containers = []
         while True:
-            if firstTime:
-                result = self.ecs.list_container_instances(cluster=cluster, maxResults=10)
-            else:    
-                result = self.ecs.list_container_instances(cluster=cluster, maxResults=10, nextToken=result['nextToken'])
+            if first_time:
+                result = self.ecs.list_container_instances(
+                    cluster=cluster, maxResults=10)
+            else:
+                result = self.ecs.list_container_instances(
+                    cluster=cluster, maxResults=10, nextToken=result['nextToken'])
             containers += result['containerInstanceArns']
-            firstTime = False
+            first_time = False
             if 'nextToken' not in result:
                 break
         if not containers:
             return containers
-        descriptions = self.ecs.describe_container_instances(cluster=cluster, containerInstances=containers)['containerInstances']
-        reservations = self.ec2.describe_instances(InstanceIds = map(lambda d: d['ec2InstanceId'], descriptions))['Reservations']
-        instances = [item for sub in [r['Instances'] for r in reservations] for item in sub]
-        byId = defaultdict(lambda: "None", [(i['InstanceId'], i) for i in instances])
-        return descriptions
-        #return map(lambda d: "Instance Id: " + d['ec2InstanceId'] + ", Type: " + [x for x in d['attributes'] if x['name'] == 'ecs.instance-type'][0]['value'] + ", IP address: " + ipById[d['ec2InstanceId']] , descriptions)
-    
-    def retrieveServicesForCluster(self, cluster):
-        firstTime = True
+        descriptions = self.ecs.describe_container_instances(
+            cluster=cluster, containerInstances=containers)['containerInstances']
+        descs_by_id = defaultdict(
+            itertools.repeat("None").next, [(d['ec2InstanceId'], d) for d in descriptions])
+        ids = [d['ec2InstanceId'] for d in descriptions]
+        reservations = self.ec2.describe_instances(InstanceIds=ids)['Reservations']
+        instances = [item for sub in [r['Instances']
+                                      for r in reservations] for item in sub]
+        by_id = defaultdict(
+            lambda: "None", [(i['InstanceId'], i) for i in instances])
+        return dict((key, (descs_by_id[key], by_id[key])) for key in descs_by_id.iterkeys())
+
+    def retrieve_services(self, cluster):
+        first_time = True
         services = []
         while True:
-            if firstTime:
+            if first_time:
                 result = self.ecs.list_services(cluster=cluster, maxResults=10)
-            else:    
-                result = self.ecs.list_services(cluster=cluster, maxResults=10, nextToken=result['nextToken'])
+            else:
+                result = self.ecs.list_services(
+                    cluster=cluster, maxResults=10, nextToken=result['nextToken'])
             services += result['serviceArns']
-            firstTime = False
+            first_time = False
             if 'nextToken' not in result:
                 break
-        return self.retrieveServiceDescriptionsByArn(cluster, services)
-    
-    def retrieveServiceDescriptionsByArn(self, cluster, services):
+        return self.retrieve_service_descriptions(cluster, services)
+
+    def retrieve_service_descriptions(self, cluster, services):
         descriptions = []
         threads = []
         queue = Queue.Queue()
         for i in range(0, len(services), 10):
-            thread_ = threading.Thread(target = self.describe_services, args = [queue, cluster, services[i:i+10]])
+            thread_args = [queue, cluster, services[i:i + 10]]
+            thread_ = threading.Thread(target=self.describe_services, args=thread_args)
             thread_.start()
             threads.append(thread_)
-        
+
         for thread in threads:
             thread.join()
             descriptions += queue.get()
 
         return dict((s['serviceArn'], s) for s in descriptions)
 
-    def describe_services(self, queue, cluster, services):
-        queue.put(self.ecs.describe_services(cluster=cluster, services = services)['services'])
-    
-    def retrieveTasksForService(self, cluster, service):
-        tasksList = self.ecs.list_tasks(cluster = cluster, serviceName = service)
-        firstTime = True
+    def retrieve_tasks(self, cluster, service):
+        first_time = True
         tasks = []
         while True:
-            if firstTime:
-                result = self.ecs.list_tasks(cluster=cluster, serviceName = service, maxResults=10)
-            else:    
-                result = self.ecs.list_tasks(cluster=cluster, serviceName = serviceName, maxResults=10, nextToken=result['nextToken'])
+            if first_time:
+                result = self.ecs.list_tasks(
+                    cluster=cluster, serviceName=service, maxResults=10)
+            else:
+                next_token = result['nextToken']
+                result = self.ecs.list_tasks(
+                    cluster=cluster, serviceName=service, maxResults=10, nextToken=next_token)
             tasks += result['taskArns']
-            firstTime = False
+            first_time = False
             if 'nextToken' not in result:
                 break
-        return self.retrieveTaskDescriptionsByArn(cluster, tasks)
-    
-    def retrieveTaskDescriptionsByArn(self, cluster, tasks):
-        descriptions = self.ecs.describe_tasks(cluster=cluster, tasks = tasks)['tasks']
-        
+        return self.retrieve_task_descriptions(cluster, tasks)
+
+    def retrieve_task_descriptions(self, cluster, tasks):
+        descriptions = self.ecs.describe_tasks(
+            cluster=cluster, tasks=tasks)['tasks']
+
         return dict((s['taskArn'], s) for s in descriptions)
 
     def describe_services(self, queue, cluster, services):
-        queue.put(self.ecs.describe_services(cluster=cluster, services = services)['services'])
+        queue.put(self.ecs.describe_services(
+            cluster=cluster, services=services)['services'])
 
-    def retrieveClusters(self):
-        roleArn = "arn:aws:iam::" + self.acct_to_assume + ":role/" + self.role_to_assume
-        response = self.client.assume_role( RoleArn=roleArn, RoleSessionName="stackMonitor")
-         
-        creds=response['Credentials']
-        self.ecs = boto3.client('ecs', 
-                aws_access_key_id = creds['AccessKeyId'],
-                aws_secret_access_key = creds['SecretAccessKey'],
-                aws_session_token = creds['SessionToken'])
-
-        self.ec2 = boto3.client('ec2', 
-                aws_access_key_id = creds['AccessKeyId'],
-                aws_secret_access_key = creds['SecretAccessKey'],
-                aws_session_token = creds['SessionToken'])
+    def retrieve_clusters(self):
         arns = []
-        firstTime = True
+        first_time = True
         while True:
-            if firstTime:
+            if first_time:
                 result = self.ecs.list_clusters(maxResults=100)
-            else:    
-                result = self.ecs.list_clusters(maxResults=100, nextToken=result['nextToken'])
+            else:
+                result = self.ecs.list_clusters(
+                    maxResults=100, nextToken=result['nextToken'])
             arns += result['clusterArns']
-            firstTime = False
+            first_time = False
             if 'nextToken' not in result:
                 break
 
-        return self.retrieveClusterDescriptionsByArn(arns)
+        return self.retrieve_cluster_descs(arns)
