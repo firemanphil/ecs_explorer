@@ -2,7 +2,7 @@ from setuptools import setup
 setup(
     name = 'ecs_explorer',
     packages = ['ecs_explorer'], # this must be the same as the name above
-    version = '0.1',
+    version = '0.2',
     description = 'CLI for exploring AWS ECS resources',
     author = 'Philip Ince',
     author_email = 'fireman.phil@gmail.com',
