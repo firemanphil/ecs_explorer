@@ -47,7 +47,7 @@ class EcsClient(object):
             if 'nextToken' not in result:
                 break
         if not containers:
-            return containers
+            return dict()
         descriptions = self.ecs.describe_container_instances(
             cluster=cluster, containerInstances=containers)['containerInstances']
         descs_by_id = defaultdict(
