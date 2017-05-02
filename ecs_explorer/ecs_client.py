@@ -90,30 +90,59 @@ class EcsClient(object):
             descriptions += queue.get()
 
         return dict((s['serviceArn'], s) for s in descriptions)
+    
+    def get_tasks_results(self, raw):
+        return raw['taskArns']
 
-    def retrieve_tasks(self, cluster, service):
+    def retrieve_tasks(self, cluster):
+        tasks = self.retrieve_with_paging(self.ecs.list_tasks, self.get_tasks_results, cluster = cluster)
+        return self.retrieve_task_descriptions(cluster, tasks)
+
+    def retrieve_tasks_for_service(self, cluster, service):
+        tasks = self.retrieve_with_paging(self.ecs.list_tasks, self.get_tasks_results, cluster = cluster, serviceName = service)
+        return self.retrieve_task_descriptions(cluster, tasks)
+
+    def retrieve_tasks_for_container(self, cluster, container):
+        tasks = self.retrieve_with_paging(self.ecs.list_tasks, self.get_tasks_results, cluster = cluster, containerInstance = container)
+        return self.retrieve_task_descriptions(cluster, tasks)
+    
+    def retrieve_with_paging(self, retrieval_func, results_func, **kwargs):
         first_time = True
-        tasks = []
+        to_return = []
+        kwargs['maxResults'] = 10
         while True:
             if first_time:
-                result = self.ecs.list_tasks(
-                    cluster=cluster, serviceName=service, maxResults=10)
+                result = retrieval_func(**kwargs)
+                to_return += results_func(result)
             else:
-                next_token = result['nextToken']
-                result = self.ecs.list_tasks(
-                    cluster=cluster, serviceName=service, maxResults=10, nextToken=next_token)
-            tasks += result['taskArns']
+                kwargs['nextToken'] = result['nextToken']
+                result = retrieval_func(**kwargs)
+                to_return += results_func(result)
             first_time = False
             if 'nextToken' not in result:
                 break
-        return self.retrieve_task_descriptions(cluster, tasks)
+        return to_return
 
     def retrieve_task_descriptions(self, cluster, tasks):
-        descriptions = self.ecs.describe_tasks(
-            cluster=cluster, tasks=tasks)['tasks']
+        descriptions = []
+        threads = []
+        queue = Queue.Queue()
+        for i in range(0, len(tasks), 10):
+            thread_args = [queue, cluster, tasks[i:i + 10]]
+            thread_ = threading.Thread(target=self.describe_tasks, args=thread_args)
+            thread_.start()
+            threads.append(thread_)
+
+        for thread in threads:
+            thread.join()
+            descriptions += queue.get()
 
         return dict((s['taskArn'], s) for s in descriptions)
 
+    def describe_tasks(self, queue, cluster, tasks):
+        queue.put(self.ecs.describe_tasks(
+            cluster=cluster, tasks=tasks)['tasks'])
+    
     def describe_services(self, queue, cluster, services):
         queue.put(self.ecs.describe_services(
             cluster=cluster, services=services)['services'])
