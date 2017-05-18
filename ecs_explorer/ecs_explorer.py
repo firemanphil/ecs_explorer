@@ -3,31 +3,35 @@
 import json
 import datetime
 from datetime import datetime
-import sys
 import string
+import subprocess
 import argparse
-from ecs_client import EcsClient
-from urwid.command_map import ACTIVATE
 import urwid
+from urwid.command_map import ACTIVATE
+from ecs_client import EcsClient
+from widgets import Cluster 
+from widgets import RefreshableItems
+from settings import SSH_SCRIPT
+from settings import ECS_CLIENT
 
 class BodyController(object):
 
     EMPTY_FILTER_TEXT = "< start typing to filter the results >"
 
     def __init__(self, initial_buttons):
-        self.list_stack = [('Clusters', initial_buttons)]
+        self.list_stack = [initial_buttons]
         self.all_styled_buttons = [urwid.AttrMap(b, None, 'reveal focus')
-                          for b in initial_buttons]
+                                   for b in initial_buttons.items]
         self.list_walker = ChooseFromListWalker(self.all_styled_buttons, self)
         list_box = ChooseFromListBox(self.list_walker)
 
         column_array = convert_details_to_columns(
-            initial_buttons[0].retrieve_important_details())
+            initial_buttons.items[0].retrieve_important_details())
 
         self.cols = urwid.Columns(
-            [('weight', 1, column_array[0]), ('weight', 4,column_array[1])], )
+            [('weight', 1, column_array[0]), ('weight', 4, column_array[1])], )
         self.detail_view = False
-        self.base_title_text = self.list_stack[-1][0]
+        self.base_title_text = self.list_stack[-1].items_title
         self.title = urwid.AttrMap(urwid.Text(self.base_title_text + " " + self.EMPTY_FILTER_TEXT), 'title')
         self.cols_title = urwid.AttrMap(urwid.Text(u'Attributes'), 'title')
         self.body = urwid.Pile([(2, urwid.Filler(self.title, valign='top')), list_box, (
@@ -64,9 +68,9 @@ class BodyController(object):
         if len(self.list_stack) > 1:
             del item.lines[:]
             self.list_stack.pop()
-            top_title, previous = self.list_stack[-1]
-            self.all_styled_buttons = [urwid.AttrMap(c, None, 'reveal focus') for c in previous]
-            self.base_title_text = top_title
+            previous = self.list_stack[-1]
+            self.all_styled_buttons = [urwid.AttrMap(c, None, 'reveal focus') for c in previous.items]
+            self.base_title_text = previous.items_title
             self.title.base_widget.set_text(self.base_title_text + " " + self.EMPTY_FILTER_TEXT)
             item.lines.extend(self.all_styled_buttons)
             item.set_focus(0)
@@ -74,18 +78,23 @@ class BodyController(object):
 
     def show_children(self, list_walker):
         item = list_walker.lines[list_walker.focus].base_widget
-        top_title, children = item.retrieve_children()
+        refreshable_items = RefreshableItems(item.retrieve_children, [])
 
-        self.show_next_level(list_walker, children, top_title)
-    
-    def show_next_level(self, list_walker, new_items, new_title, highlight_text=None):
+        self.show_next_level(list_walker, refreshable_items)
+
+    def update(self, list_walker):
+        current = self.list_stack.pop()
+        current.refresh()
+        self.show_next_level(list_walker, current, current.highlighted)
+
+    def show_next_level(self, list_walker, new_items, highlight_text=None):
         if new_items:
-            self.base_title_text = new_title
+            self.base_title_text = new_items.items_title
             self.title.base_widget.set_text(self.base_title_text + " " + self.EMPTY_FILTER_TEXT)
             list_walker.set_focus(0)
             del list_walker.lines[:]
-            self.list_stack.append((new_title, new_items))
-            self.all_styled_buttons = [urwid.AttrMap(ch, None, 'reveal focus') for ch in new_items]
+            self.list_stack.append(new_items)
+            self.all_styled_buttons = [urwid.AttrMap(ch, None, 'reveal focus') for ch in new_items.items]
             list_walker.lines.extend(self.all_styled_buttons)
             if highlight_text is None:
                 list_walker.set_focus(0)
@@ -98,23 +107,28 @@ class BodyController(object):
             self.filter_string = self.filter_string[:-1]
         else:
             self.filter_string += str(key)
-        if len(self.filter_string) > 0: 
+        if len(self.filter_string) > 0:
             self.title.base_widget.set_text(self.base_title_text + " - filter=" + self.filter_string)
         else:
             self.title.base_widget.set_text(self.base_title_text + " " + self.EMPTY_FILTER_TEXT)
-        self.list_walker.lines = list(filter(lambda item : item.base_widget.contains_word(self.filter_string), self.all_styled_buttons))
+        self.list_walker.lines = list(filter(lambda item: item.base_widget.contains_word(self.filter_string), self.all_styled_buttons))
         if len(self.list_walker.lines) > 0:
             self.list_walker.set_focus(0)
         self.list_walker._modified()
 
     def pass_special_instruction(self, list_walker, key):
         item = list_walker.lines[list_walker.focus].base_widget
-        
-        result = item.retrieve_by_highlight(key)
-        if result is None:
-            return key
-        top_title, new_items, highlight_text = result 
-        self.show_next_level(list_walker, new_items, top_title, highlight_text)
+        type_of_action, args = item.special_action(key)
+        key_dealt_with = False
+        if type_of_action is "SSH" and SSH_SCRIPT is not None:
+            subprocess.call([SSH_SCRIPT, args])
+            key_dealt_with = True
+
+        if not key_dealt_with:
+            result = RefreshableItems(item.retrieve_by_highlight, key)
+            if len(result.items) is 0:
+                return key
+            self.show_next_level(list_walker, result, highlight_text=result.highlighted)
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -136,186 +150,6 @@ class DetailListBox(urwid.ListBox):
         else:
             super(DetailListBox, self).keypress(size, key)
 
-
-class EcsButton(urwid.Button):
-
-    def __init__(self, identifier, name, detail):
-        self.identifier = identifier
-        self.detail = detail
-        self.name = name
-        self.showing_detail = False
-        super(EcsButton, self).__init__(name)
-
-    def retrieve_children(self):
-        pass
-
-    def retrieve_by_highlight(self, key):
-        pass
-
-    def contains_word(self, word):
-        return word.lower() in self.name.lower()
-
-class Cluster(EcsButton):
-    clustersByName = dict()
-
-    def __init__(self, identifier, name, detail):
-        super(Cluster, self).__init__(identifier, name, detail)
-
-    def retrieve_important_details(self):
-        return [("Status", self.detail['status']),
-                (["Active ", ('key', "S"), "ervices"], self.detail['activeServicesCount']),
-                (["Running ", ('key', "T"), "asks"], self.detail['runningTasksCount']),
-                ("Pending Tasks", self.detail['pendingTasksCount']),
-                ([('key',"C"), "ontainers"], self.detail['registeredContainerInstancesCount'])]
-
-    def retrieve_children(self):
-        return ("Choose sub-resource", [ServicesLabel(self.identifier), ContainersLabel(self.identifier)])
-
-    def retrieve_by_highlight(self, key):
-        if key is "T":
-            return ("Tasks", [Task(None, self.identifier, t['taskArn'].split("/")[1], t) for t in ECS_CLIENT.retrieve_tasks(self.identifier).values()], None)
-        if key is "S":
-            return ("Services", [Service(s['serviceArn'], s['serviceName'], self.identifier, s) for s in ECS_CLIENT.retrieve_services(self.identifier).values()], None)
-        if key is "C":
-            containers = ECS_CLIENT.retrieve_containers(self.identifier)
-            containers_by_id = dict((value[0]['containerInstanceArn'], value) for (key, value) in containers.iteritems())
-            return ("Containers", [Container(key, key.split("/")[1], self.identifier, value) for (key, value) in containers_by_id.iteritems()], None)
-
-
-class ServicesLabel(EcsButton):
-    def __init__(self, cluster_identifier):
-        super(ServicesLabel, self).__init__(cluster_identifier, "Services", "")
-
-    def retrieve_children(self):
-        return ("Services", [Service(s['serviceArn'], s['serviceName'], self.identifier, s) for s in ECS_CLIENT.retrieve_services(self.identifier).values()])
-
-    def retrieve_important_details(self):
-        return []
-
-
-class ContainersLabel(EcsButton):
-    def __init__(self, cluster_identifier):
-        super(ContainersLabel, self).__init__(
-            cluster_identifier, "Containers", "")
-
-    def retrieve_children(self):
-        containers = ECS_CLIENT.retrieve_containers(self.identifier)
-        containers_by_id = dict((value[0]['containerInstanceArn'], value) for (key, value) in containers.iteritems())
-        return ("Containers", [Container(key, key.split("/")[1], self.identifier, value) for (key, value) in containers_by_id.iteritems()])
-
-    def retrieve_important_details(self):
-        return []
-
-
-class Container(EcsButton):
-
-    def __init__(self, identifier, name, cluster_identifier, detail):
-        super(Container, self).__init__(identifier, name, detail)
-        self.cluster_identifier = cluster_identifier
-
-    def retrieve_children(self):
-        return (None, None)
-
-    def retrieve_important_details(self):
-        cont_detail = self.detail[0]
-        attributes = cont_detail['attributes']
-        registered_resources = cont_detail['registeredResources']
-        available_resources = cont_detail['remainingResources']
-        ami_id = next(
-            obj for obj in attributes if obj['name'] == 'ecs.ami-id')['value']
-        instance_type = next(
-            obj for obj in attributes if obj['name'] == 'ecs.instance-type')['value']
-        availability_zone = next(
-            obj for obj in attributes if obj['name'] == 'ecs.availability-zone')['value']
-        available_memory = next(
-            obj for obj in available_resources if obj['name'] == 'MEMORY')['integerValue']
-        total_memory = next(
-            obj for obj in registered_resources if obj['name'] == 'MEMORY')['integerValue']
-        available_cpu = next(obj for obj in available_resources if obj['name'] == 'CPU')[
-            'integerValue']
-        total_cpu = next(obj for obj in registered_resources if obj['name'] == 'CPU')[
-            'integerValue']
-        taken_ports = ", ".join(sorted(next(
-            obj for obj in available_resources if obj['name'] == 'PORTS')['stringSetValue']))
-        return [('Status', cont_detail['status']),
-                ('EC2 Instance Id', cont_detail['ec2InstanceId']),
-                ('Private IP', self.detail[1]['PrivateIpAddress']),
-                ('Private DNS Name', self.detail[1]['PrivateDnsName']),
-                ('Public DNS Name', self.detail[1]['PublicDnsName']),
-                (['Running ', ('key','T'), 'asks'], cont_detail['runningTasksCount']),
-                ('Pending Tasks', cont_detail['pendingTasksCount']),
-                ('AMI Id', ami_id),
-                ('Instance Type', instance_type),
-                ('Availability Zone', availability_zone),
-                ('Memory', 'Available: ' + str(available_memory) +
-                 " Total: " + str(total_memory)),
-                ('CPU', 'Available: ' + str(available_cpu) +
-                 " Total: " + str(total_cpu)),
-                ('Taken ports', taken_ports)]
-
-    def retrieve_by_highlight(self, key):
-        if key is "T":
-            return ("Tasks", [Task(self.identifier, self.cluster_identifier, t['taskArn'].split("/")[1], t) for t in ECS_CLIENT.retrieve_tasks_for_container(self.cluster_identifier, self.identifier).values()], None)
-
-class Service(EcsButton):
-
-    def __init__(self, identifier, name, cluster_identifier, detail):
-        super(Service, self).__init__(identifier, name, detail)
-        self.cluster_identifier = cluster_identifier
-
-    def retrieve_children(self):
-        return ("Tasks", [Task(self.identifier, self.cluster_identifier, t['taskArn'].split("/")[1], t) for t in ECS_CLIENT.retrieve_tasks_for_service(self.cluster_identifier, self.identifier).values()])
-
-    def retrieve_important_details(self):
-        deployment_config = self.detail['deploymentConfiguration']
-        min_bracket = deployment_config['minimumHealthyPercent']
-        max_bracket = deployment_config['maximumPercent']
-        desired = self.detail['desiredCount']
-
-        return [('Status', self.detail['status']),
-                ('Task Definition', self.detail['taskDefinition']),
-                ('Running', self.detail['runningCount']),
-                ('Pending', self.detail['pendingCount']),
-                ('Desired', self.detail['desiredCount']),
-                ('Redeployment bracket', "Min: " + str(min_bracket) + "%, Max: " + str(max_bracket) + "%")]
-
-
-class Task(EcsButton):
-
-    def __init__(self, service_identifier, cluster_identifier, identifier, detail):
-        super(Task, self).__init__(identifier, identifier, detail)
-        self.service_identifier = service_identifier
-        self.cluster_identifier = cluster_identifier
-
-    def retrieve_children(self):
-        return (None, None)
-
-    def rewrite_container(self, container):
-        network_bindings = container['networkBindings']
-        bindings = [network['bindIP'] + " (" + str(network['hostPort']) + "[host] -> " + str(
-            network['containerPort']) + "[network])" for network in network_bindings]
-        if bindings is []:
-            bindings = "no network binding"
-        else:
-            bindings = ', '.join(bindings)
-        return container['name'] + " -> " + bindings
-
-    def retrieve_important_details(self):
-        containers = [self.rewrite_container(cont)
-                      for cont in self.detail['containers']]
-        return [('Status', self.detail['lastStatus']),
-                ('Desired Status', self.detail['desiredStatus']),
-                ('Task Definition', self.detail['taskDefinitionArn']),
-                (['Container ', ('key', 'I'), 'nstance ID'],
-                 self.detail['containerInstanceArn'].split("/", 1)[1]),
-                ('Containers', '\n'.join(containers))]
-    
-    def retrieve_by_highlight(self, key):
-        if key is "I":
-            containers = ECS_CLIENT.retrieve_containers(self.cluster_identifier)
-            containers_by_id = dict((value[0]['containerInstanceArn'], value) for (key, value) in containers.iteritems())
-            return ("Containers", [Container(key, key.split("/")[1], self.cluster_identifier, value) for (key, value) in containers_by_id.iteritems()], self.detail['containerInstanceArn'].split("/", 1)[1])
-
 def convert_details_to_columns(details):
     labels = []
     data = []
@@ -334,11 +168,9 @@ def convert_details_to_columns(details):
     filler2 = urwid.Filler(urwid.Text(text2, 'left'), valign='top')
     return [filler1, filler2]
 
-
 def exit_on_cr(key):
-    if isinstance(key, basestring) and key in ('Q'):
+    if isinstance(key, basestring) and key in 'Q':
         raise urwid.ExitMainLoop()
-
 
 class ChooseFromListBox(urwid.ListBox):
 
@@ -360,7 +192,7 @@ class ChooseFromListWalker(urwid.ListWalker):
     def focus_on(self, text):
         texts = [s.base_widget.label for s in self.lines]
         self.set_focus(texts.index(text))
-    
+
     def set_focus(self, focus):
         self.focus = focus
         BODY_CONTROLLER.item_focus_change(self.lines[focus].base_widget)
@@ -375,7 +207,6 @@ class ChooseFromListWalker(urwid.ListWalker):
         return self._get_at_pos(start_from - 1)
 
     def _get_at_pos(self, pos):
-        """Return a widget for the line number passed."""
         if pos < 0:
             return None, None
 
@@ -385,26 +216,21 @@ class ChooseFromListWalker(urwid.ListWalker):
         return None, None
 
     def keypress(self, size, key):
-        if key in list(string.ascii_lowercase) or key =="backspace":
+        if key in list(string.ascii_lowercase) or key == "backspace":
             self.controller.filter_by(key)
         elif key == 'D':
             BODY_CONTROLLER.toggle_detail(self.lines[self.focus].base_widget)
         elif key == 'B':
             BODY_CONTROLLER.show_parent_list(self)
         elif key == 'U':
-            # show detail
-            pass
+            BODY_CONTROLLER.update(self)
         elif key in list(string.ascii_uppercase):
             self.controller.pass_special_instruction(self, key)
         elif self.get_focus()[0] is not None and self.get_focus()[0]._command_map[key] == ACTIVATE:
             BODY_CONTROLLER.show_children(self)
         return key
 
-PARSER = argparse.ArgumentParser()
-PARSER.add_argument("--role", default=None, help='An STS role to assume')
 
-ARGS = PARSER.parse_args()
-ECS_CLIENT = EcsClient(ARGS.role)
 
 PALETTE = [('title', 'yellow', 'dark blue'),
            ('reveal focus', 'black', 'white'),
@@ -412,10 +238,11 @@ PALETTE = [('title', 'yellow', 'dark blue'),
 FOOTER = urwid.AttrMap(urwid.Text(
     u'Press \'U\' to update, \'<enter>\' to look at sub-resources,\'D\' to look at more detail, \'B\' to go back to the previous page and \'Q\' to quit'), 'title')
 
-CLUSTERS = [Cluster(c, k['clusterName'], k)
-            for (c, k) in ECS_CLIENT.retrieve_clusters().items()]
-CLUSTERS.sort(lambda x, y: cmp(x.name, y.name))
-BODY_CONTROLLER = BodyController(CLUSTERS)
+def retrieve_clusters():
+    return ('Clusters', [Cluster(c, k['clusterName'], k)
+            for (c, k) in ECS_CLIENT.retrieve_clusters().items()])
+
+BODY_CONTROLLER = BodyController(RefreshableItems(retrieve_clusters, []))
 
 LAYOUT = urwid.Frame(body=BODY_CONTROLLER.body, footer=FOOTER)
 
