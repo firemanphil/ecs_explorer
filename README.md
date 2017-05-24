@@ -1,6 +1,7 @@
 ## ECS Explorer
 
 ECS Explorer is a CLI that allows you to browse and inspect your AWS ECS resources.
+![alt text](https://raw.githubusercontent.com/firemanphil/ecs_explorer/master/tty.gif)
 
 ## Motivation
 
